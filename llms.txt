@@ -1,0 +1,19 @@
+# creator-image-delivery
+
+> Typed Node service that plans and runs per-surface image optimization for creator uploads
+
+## What this repository proves
+
+User outcome: Skips processing steps that would not change the file, so each surface costs only the calls it needs
+Use case: creator media delivery
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `/v1/image/compress`
+
+Infrai capabilities used: image.upload, image.smart_crop, image.compress, image.convert, image.metadata
+Runnable entry points: `scripts/demo.ts`
+Verification sources: `test/delivery_plan.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt

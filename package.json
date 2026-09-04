@@ -1,0 +1,23 @@
+{
+  "name": "creator-image-delivery",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Typed ingest service that plans and runs image optimization per creator surface",
+  "scripts": {
+    "start": "node --experimental-strip-types src/ingest_service.ts",
+    "demo": "node --experimental-strip-types scripts/demo.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.2"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}
