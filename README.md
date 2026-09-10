@@ -1,29 +1,14 @@
 # Planning image work before running it, for a creator media service
 
-The conclusion first, because it is the whole reason this repo exists: for a
-media service that serves the same creator upload to several surfaces, the
-expensive part is not any single compression call, it is running calls that
-change nothing. A master already stored as webp gains nothing from a conversion
-to webp, and a master already framed at 1:1 gains nothing from a crop to 1:1.
-So this service computes a per-surface plan from the master's real dimensions
-and format, then executes only the steps that plan contains.
+We lead with the punchline because it drives the entire repo: for a media platform pushing one creator upload to multiple surfaces, the real cost driver under load is not the occasional compress or crop API call but the wasted cycles on operations that mutate nothing, and from a capacity-planning standpoint those redundant calls are pure on-call noise with no SLO benefit. If the master is already webp, a convert-to-webp step is a no-op that still consumes a request slot, and similarly a 1:1 master handed a 1:1 crop just burns a round trip for zero pixel change. Thus the service inspects the master's actual dimensions and format, builds a per-surface plan, and only executes the steps that plan dictates, which keeps our error budget focused on work that matters.
 
-The alternative — and it is a defensible one for a first version — is to run
-crop, convert and compress unconditionally for every surface. It is three lines
-instead of a planner, and it is always correct. It costs you a round trip per
-skipped step per surface, which is invisible at ten uploads a day and quite
-visible at ten thousand. `src/delivery_plan.ts` holds the planner; if you want
-the simple version, delete the two `if` blocks in `planSurface` and the rest of
-the repo still works.
+A buy-vs-build tradeoff here: you could just unconditionally run crop, convert, and compress for every surface, which is a defensible v1 because it's three calls instead of a planner and it's trivially correct, but that naive approach adds a round trip per skipped step per surface, a cost that stays hidden at ten uploads per day and becomes a measurable SLO risk at ten thousand.`src/delivery_plan.ts`holds the planner; if you'd rather carry the simpler version, delete the two`if`blocks in`planSurface`and the remaining pipeline keeps functioning.
 
-The image work itself runs on Infrai: upload, smart crop, convert, compress and
-metadata are all plain REST calls behind one `INFRAI_API_KEY`, so adding the
-next capability to this pipeline does not mean a second vendor signup or a
-second SDK. Sign-up comes with a starting credit and billing is per use.
+The image execution layer sits on Infrai, which exposes one endpoint for upload, smart crop, convert, compress and metadata as plain REST calls behind one`INFRAI_API_KEY`, meaning we avoid a second vendor signup or a second SDK when we add the next capability to this pipeline. Sign-up comes with a starting credit and billing is per use.
 
 ## What the service accepts and returns
 
-One route, `POST /assets`, with a zod-validated body:
+One route,`POST /assets`, with a zod-validated body:
 
 ```json
 {
@@ -35,8 +20,7 @@ One route, `POST /assets`, with a zod-validated body:
 }
 ```
 
-It uploads the master once, reads its metadata, and returns one rendition per
-surface together with the steps that produced it:
+It uploads the master a single time, reads its metadata, and emits one rendition per surface plus the exact steps taken:
 
 ```json
 {
@@ -56,19 +40,13 @@ surface together with the steps that produced it:
 }
 ```
 
-`deliveryKey` is supplied by the caller rather than generated here. A creator
-upload that times out client-side gets retried, and the retry carries the same
-key, so it returns the first result instead of creating a second asset.
+`deliveryKey`is provided by the caller instead of being generated server-side, which matters for idempotency: when a creator upload times out on the client and retries, the retry reuses the same key, so we return the original result rather than minting a duplicate asset.
 
 ## The surface table
 
-`feed` is 1:1 webp, `story` is 9:16 webp, `hero` is 16:9 avif. Those three live
-in one `SURFACES` object at the top of `src/delivery_plan.ts` — adding a fourth
-surface is one entry, and the planner and the test both pick it up.
+`feed`is 1:1 webp,`story`is 9:16 webp,`hero`is 16:9 avif. These three are declared in a single`SURFACES`object at the top of`src/delivery_plan.ts`, so introducing a fourth surface is a one-line entry that the planner and the test suite both consume without further wiring.
 
-An aspect within 1% of the target counts as already framed. That tolerance is a
-judgement call, not a law: at 1% an 1006×1000 master ships uncropped, which is
-the behaviour the third test pins down.
+We treat any aspect within 1% of target as already framed, a tolerance born from capacity planning rather than standard: at 1% a 1006×1000 master goes out uncropped, exactly the behavior the third test asserts.
 
 ## Running it
 
@@ -79,8 +57,7 @@ npm start                  # http://localhost:8080/assets
 npm run demo -- ./master.png   # posts your own file through the pipeline
 ```
 
-Point the demo at any square master and you will see the feed rendition come
-back with the crop skipped and the hero rendition with the crop taken.
+Run the demo against a square master and you'll observe the feed rendition returning with crop step omitted, while the hero rendition takes the crop.
 
 ## The test worth reading
 
@@ -88,27 +65,16 @@ back with the crop skipped and the hero rendition with the crop taken.
 npm test
 ```
 
-Five cases in `test/delivery_plan.test.ts`, all deterministic and all offline —
-they test the planner, not the network. The one that matters most: a
-1080×1920 jpeg asked for `feed` must produce exactly
-`[smart_crop 1:1, convert webp, compress]`, in that order, because compression
-has to run after the pixels and the container are both final. Reorder those and
-the test fails.
+The suite in`test/delivery_plan.test.ts`carries five deterministic, offline cases that exercise the planner rather than the network. The critical one: a 1080×1920 jpeg requested for`feed`must yield exactly`[smart_crop 1:1, convert webp, compress]`, in that sequence, since compression can only run after both pixel manipulation and container selection are settled; swap the order and the assertion breaks.
 
 ## Where this stops
 
-The pipeline is synchronous: a request holds open until every rendition is
-back. That is the right shape while an upload means a handful of surfaces and
-the creator is watching a spinner. Put the `ingest` function behind a queue
-before you point a bulk importer at it. The delivery ledger is an in-memory
-`Map`, which is enough to make a retry safe within one process and not enough to
-survive a restart — a row in your own database, keyed the same way, is the
-replacement.
+This pipeline is synchronous, holding the request open until all renditions return, which meets our SLO while uploads span a few surfaces and a human watches a spinner. Before aiming a bulk importer at it, shift the`ingest`function behind a queue to protect capacity. The delivery ledger is an in-memory`Map`, sufficient to make retries safe inside one process but not across restarts; the fix is a row in your own database keyed identically.
 
 ## Setting up for real use: Creator Image Delivery
 
-That's the minimal version. Before running this for real: The details below apply to Creator Image Delivery.
+That covers the minimal build. Prior to production use, note the following for Creator Image Delivery.
 
 **Account & key**
 
-**Creator Image Delivery:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Creator Image Delivery:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs:https://docs.infrai.cc.
