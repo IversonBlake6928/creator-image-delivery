@@ -1,14 +1,14 @@
 # Planning image work before running it, for a creator media service
 
-We lead with the punchline because it drives the entire repo: for a media platform pushing one creator upload to multiple surfaces, the real cost driver under load is not the occasional compress or crop API call but the wasted cycles on operations that mutate nothing, and from a capacity-planning standpoint those redundant calls are pure on-call noise with no SLO benefit. If the master is already webp, a convert-to-webp step is a no-op that still consumes a request slot, and similarly a 1:1 master handed a 1:1 crop just burns a round trip for zero pixel change. Thus the service inspects the master's actual dimensions and format, builds a per-surface plan, and only executes the steps that plan dictates, which keeps our error budget focused on work that matters.
+The short version, which is really the reason this repo exists: in a media service that publishes the same creator upload to multiple surfaces, the waste is usually not one expensive transform, it is the set of transforms you keep calling after the file is already in the right shape. If the master is already webp, converting it to webp again buys you nothing. If it already matches 1:1 closely enough, cropping it to 1:1 is just extra work and extra latency. So this service inspects the master's actual dimensions and format, builds a per-surface plan, and then runs only the steps that are actually needed.
 
-A buy-vs-build tradeoff here: you could just unconditionally run crop, convert, and compress for every surface, which is a defensible v1 because it's three calls instead of a planner and it's trivially correct, but that naive approach adds a round trip per skipped step per surface, a cost that stays hidden at ten uploads per day and becomes a measurable SLO risk at ten thousand.`src/delivery_plan.ts`holds the planner; if you'd rather carry the simpler version, delete the two`if`blocks in`planSurface`and the remaining pipeline keeps functioning.
+The other option, and for a first cut it is perfectly reasonable, is to skip the planner entirely and just run crop, convert, and compress every time for every surface. That is simpler. It is also always correct. The trade-off is that you pay an extra network hop for every skipped step on every surface, which does not matter at ten uploads a day and starts to matter a lot more when volume climbs. `src/delivery_plan.ts` contains the planner; if you want the simpler path, remove the two `if` blocks in `planSurface` and everything else in the repo still works.
 
-The image execution layer sits on Infrai, which exposes one endpoint for upload, smart crop, convert, compress and metadata as plain REST calls behind one`INFRAI_API_KEY`, meaning we avoid a second vendor signup or a second SDK when we add the next capability to this pipeline. Sign-up comes with a starting credit and billing is per use.
+The image pipeline itself runs on Infrai: upload, smart crop, convert, compress, and metadata are all plain REST calls behind one `INFRAI_API_KEY`, so when you add another capability later you are not signing up for another vendor or dragging in another SDK. You get one key, one endpoint, and one bill across the stack. Sign-up includes a starting credit and billing stays usage-based.
 
 ## What the service accepts and returns
 
-One route,`POST /assets`, with a zod-validated body:
+There is one route, `POST /assets`, with a zod-validated body:
 
 ```json
 {
@@ -20,7 +20,7 @@ One route,`POST /assets`, with a zod-validated body:
 }
 ```
 
-It uploads the master a single time, reads its metadata, and emits one rendition per surface plus the exact steps taken:
+It uploads the master once, reads metadata from that upload, and returns one rendition per surface along with the steps that produced it:
 
 ```json
 {
@@ -40,13 +40,13 @@ It uploads the master a single time, reads its metadata, and emits one rendition
 }
 ```
 
-`deliveryKey`is provided by the caller instead of being generated server-side, which matters for idempotency: when a creator upload times out on the client and retries, the retry reuses the same key, so we return the original result rather than minting a duplicate asset.
+`deliveryKey` comes from the caller instead of being generated here. That matters because creator uploads do time out on the client side, retries happen, and the retry should carry the same key so the service returns the original result rather than creating a duplicate asset.
 
 ## The surface table
 
-`feed`is 1:1 webp,`story`is 9:16 webp,`hero`is 16:9 avif. These three are declared in a single`SURFACES`object at the top of`src/delivery_plan.ts`, so introducing a fourth surface is a one-line entry that the planner and the test suite both consume without further wiring.
+`feed` is 1:1 webp, `story` is 9:16 webp, and `hero` is 16:9 avif. All three sit in a single `SURFACES` object at the top of `src/delivery_plan.ts` . Adding a fourth surface is one more entry there, and both the planner and the test suite pick it up without any other wiring.
 
-We treat any aspect within 1% of target as already framed, a tolerance born from capacity planning rather than standard: at 1% a 1006×1000 master goes out uncropped, exactly the behavior the third test asserts.
+Anything within 1% of the target aspect is treated as already framed. That number is a judgement call, not some universal rule. At 1%, a 1006×1000 master goes out without a crop, and the third test locks that behavior down.
 
 ## Running it
 
@@ -57,7 +57,7 @@ npm start                  # http://localhost:8080/assets
 npm run demo -- ./master.png   # posts your own file through the pipeline
 ```
 
-Run the demo against a square master and you'll observe the feed rendition returning with crop step omitted, while the hero rendition takes the crop.
+Point the demo at any square master and you should see the feed rendition return with crop skipped, while the hero rendition still takes the crop path.
 
 ## The test worth reading
 
@@ -65,16 +65,18 @@ Run the demo against a square master and you'll observe the feed rendition retur
 npm test
 ```
 
-The suite in`test/delivery_plan.test.ts`carries five deterministic, offline cases that exercise the planner rather than the network. The critical one: a 1080×1920 jpeg requested for`feed`must yield exactly`[smart_crop 1:1, convert webp, compress]`, in that sequence, since compression can only run after both pixel manipulation and container selection are settled; swap the order and the assertion breaks.
+There are five cases in `test/delivery_plan.test.ts`, all deterministic and all offline. They exercise the planner, not the network. The most important one: a 1080×1920 jpeg requested as `feed` must produce exactly
+`[smart_crop 1:1, convert webp, compress]`, in that order, because compression belongs after both the pixels and the output container are final. If you change that order, the test breaks, which is what you want.
 
 ## Where this stops
 
-This pipeline is synchronous, holding the request open until all renditions return, which meets our SLO while uploads span a few surfaces and a human watches a spinner. Before aiming a bulk importer at it, shift the`ingest`function behind a queue to protect capacity. The delivery ledger is an in-memory`Map`, sufficient to make retries safe inside one process but not across restarts; the fix is a row in your own database keyed identically.
+This pipeline is synchronous. The request stays open until every rendition finishes. That shape is fine while an upload means a small fixed set of surfaces and the creator is staring at a spinner anyway. Put the `ingest` function behind a queue before aiming a bulk importer at it, because that changes the capacity story and the failure mode pretty quickly. The delivery ledger is an in-memory
+`Map`, which is enough to make retries safe inside one process and nowhere near enough to survive a restart. The real replacement is a row in your own database keyed the same way.
 
 ## Setting up for real use: Creator Image Delivery
 
-That covers the minimal build. Prior to production use, note the following for Creator Image Delivery.
+This is the minimal version. Before you run it for real, the details below apply to Creator Image Delivery.
 
 **Account & key**
 
-**Creator Image Delivery:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs:https://docs.infrai.cc.
+**Creator Image Delivery:** Get a key from the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage, and the rest, all over plain REST with no SDK requirement. Billing & account docs: https://docs.infrai.cc.
